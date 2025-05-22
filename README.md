@@ -18,7 +18,7 @@ one_globules_morethanonecolor_melanin
 5) Сохранённая модель
 Предобученная модель (one_globules_morethanonecolor_melanin.joblib).
 
-🛠 Технологии
+Технологии
 Python 3.x
 OpenCV — обработка изображений
 scikit-learn — классификация
