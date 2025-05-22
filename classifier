@@ -1,0 +1,466 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import cv2
+import pandas as pd
+import numpy as np
+from math import sin, cos
+from matplotlib import pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.ensemble import RandomForestClassifier
+from joblib import dump, load
+
+def thresh_hold_gray(src, thresh):
+    ret,thresh_src = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY)
+    contours, hierarchy = cv2.findContours(thresh_src, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    src_contours = np.zeros(src.shape)
+    cv2.drawContours(src_contours, contours, -1, (255,255,255), 1)
+    #cv2_imshow(thresh_src)
+    return (thresh_src)
+
+def thresh_hold_gray_inv(src, thresh):
+    ret,thresh_src = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY_INV)
+    contours, hierarchy = cv2.findContours(thresh_src, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    src_contours = np.zeros(src.shape)
+    cv2.drawContours(src_contours, contours, -1, (255,255,255), 1)
+    #cv2_imshow(thresh_src)
+    return (thresh_src)
+
+def rgb2hsv_return_h(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h,s,v = cv2.split(hsv)
+    return(h)
+
+def masking(img, mask):
+    img_BGRA=cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    masked = cv2.bitwise_and(img_BGRA, img_BGRA, mask=mask)
+    masked[mask < 2] = [0, 0, 0, 0]
+    return(masked)
+
+def black_hat(src):
+  filterSize =(50,50)
+  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, filterSize)
+  blackhat_img = cv2.morphologyEx(src,cv2.MORPH_BLACKHAT,kernel)
+  #cv2_imshow(blackhat_img)
+  return(blackhat_img)
+
+def top_hat(src):
+  filterSize =(50,50)
+  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, filterSize)
+  tophat_img = cv2.morphologyEx(src, cv2.MORPH_TOPHAT,kernel)
+  #cv2_imshow(tophat_img)
+  return(tophat_img)
+
+def make_avrg_127(src):
+  src=np.float32(src)
+  mean=np.mean(src)
+  dif=mean-127
+  return(float_to_byte(src-dif))
+
+def float_to_byte (src):
+  width,height=src.shape[:2]
+  for x in range(width):
+    for y in range(height):
+      #if intensity less than threshold, assign white
+      if src[x,y] < 0:
+        src[x,y]=0
+      #if intensity greater than threshold, assign black
+      if src[x,y] >255:
+        src[x,y]=255
+  return(src.astype(np.uint8))
+
+def increase_sharpness_byte(src, r_blur, coeff):
+  src_avg=cv2.blur(src, (r_blur, r_blur))
+  src_average=np.float32(src_avg)
+  dif=src-src_average
+  dst=make_avrg_127(src_average)+coeff*dif
+  width,height=dst.shape[:2]
+  dst=float_to_byte(dst)
+  return(dst)
+
+def counters_canny(byte):
+  canny = cv2.Canny(byte, 30, 150)
+  img_cnt = cv2.dilate(canny, (1, 1), iterations=0)
+  #plt.imshow(img_cnt, cmap='gray')
+  return(img_cnt)
+
+def filter_counters(dilated, img):
+  (cnt, hierarchy) = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+  cnt_filtered=[]
+  for j in range(0,len(cnt)):
+    area = cv2.contourArea(cnt[j])
+    arclen = cv2.arcLength(cnt[j], True)
+    if ((area > 100)):
+      cnt_filtered.append(cnt[j])
+    j=j+1
+  return(cnt_filtered)
+
+def cntr_of_strc (cnt_sorted, img):
+  x_array=[]
+  y_array=[]
+  for j in range(0,len(cnt_sorted)):
+    ((x, y), radius) = cv2.minEnclosingCircle(cnt_sorted[j])
+    #cv2.circle(img, (int(x), int(y)), int(radius), (0, 255, 0), 2)
+    #cv2.circle(img, (int(x), int(y)), 5, (0, 0, 255), -1)
+    x_array.append(x)
+    y_array.append(y)
+  #print(x_array, y_array)
+  return(x_array, y_array)
+
+def overlaying(background, img, x, y):
+    overlay = background.copy()
+    place = overlay[y: y + img.shape[0], x: x + img.shape[1]]
+    a = img[..., 3:].repeat(3, axis=2).astype('uint16')
+    place[..., :3] = (place[..., :3].astype('uint16') * (255 - a) // 255) + img[..., :3].astype('uint16') * a // 255
+    return(overlay)
+
+def distance(x, y, y_0, x_0):
+  d = ((x-x_0)**2+(y-y_0)**2)**(0.5)
+  return(d)
+
+  #  cv2.equalizeHist(img_gray)
+
+def align_object(image):
+  #gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+  #_, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+  kernel = np.ones((17,17),np.uint8)
+  thresh=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2hsv_return_h(image), 20), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+  max_contour = max(contours, key=cv2.contourArea)
+
+  # Вычисление моментов контура
+  moments = cv2.moments(max_contour)
+
+    # Вычисление центра масс объекта
+  cx = int(moments['m10'] / moments['m00'])
+  cy = int(moments['m01'] / moments['m00'])
+  # Вычисление матрицы ковариации
+  cov_matrix = np.array([[moments['mu20'], moments['mu11']],
+                           [moments['mu11'], moments['mu02']]])
+
+    # Вычисление собственных значений и собственных векторов матрицы ковариации
+  eigenvalues, eigenvectors = np.linalg.eig(cov_matrix)
+
+    # Нахождение индекса наибольшего собственного значения
+  max_eigen_idx = np.argmax(eigenvalues)
+
+    # Получение соответствующего собственного вектора
+  max_eigenvector = eigenvectors[:, max_eigen_idx]
+
+    # Вычисление угла поворота
+  angle = np.arctan2(max_eigenvector[1], max_eigenvector[0])
+  angle_deg = np.degrees(angle)
+
+    # Создание матрицы поворота
+  rotation_matrix = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+
+    # Применение матрицы поворота к изображению
+  rows, cols = image.shape[:2]
+  border_val = tuple(np.mean(np.array(image)[0, :], axis=0))
+  aligned_image = cv2.warpAffine(image, rotation_matrix, (cols, rows), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                       borderValue=[int(i) for i in border_val])
+
+  #return aligned_image
+  return angle
+
+def nevus_only(img, background):
+  kernel = np.ones((17,17),np.uint8)
+  mask=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2hsv_return_h(img), 20), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  masked=masking(img, mask)
+  width=img.shape[1]
+  height = img.shape[0]
+  #background= cv.GaussianBlur(img,(65,65),0)
+  #background=np.zeros((height, width, 3), np.uint8)
+  res = overlaying(background, masked, 0, 0)
+  return(res)
+
+def good_gray(img):
+  #src=increase_sharpness_byte(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY), 12, 3)
+  src=black_hat(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY))
+  return(src)
+
+def gray2blackwhite(src):
+  kernel = np.ones((7,7),np.uint8)
+  byte=cv2.morphologyEx(thresh_hold_gray(src, 20), cv2.MORPH_OPEN, kernel)
+  return(cv2.morphologyEx(byte, cv2.MORPH_CLOSE, kernel))
+
+def byte2countors(img, byte):
+  rgb = cv2.cvtColor(img.copy(), cv2.COLOR_BGR2RGB)
+  img_cnt=counters_canny(byte)
+  cnt_filtered=filter_counters(img_cnt, img)
+  cv2.drawContours(rgb, cnt_filtered, -1, (0, 255, 0), 2)
+  return(cnt_filtered)
+
+def counturs2centers(cnt_filtered, img):
+  x_array=[]
+  y_array=[]
+  x_array, y_array =cntr_of_strc(cnt_filtered, img.copy())
+  return(x_array, y_array)
+
+def center_of_nevus_circle(img):
+  kernel = np.ones((17,17),np.uint8)
+  byte=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2hsv_return_h(img), 20), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  #cv2_imshow(byte)
+  cnt_nevus=byte2countors(img, byte)
+  ((x_0, y_0), radius) = cv2.minEnclosingCircle(cnt_nevus[0])
+  return(x_0,y_0)
+
+def centrum_globules(img):
+  blurred_background=nevus_only(img.copy(),cv2.GaussianBlur(img,(65,65),0))
+  #cv2_imshow(blurred_background)
+  src=good_gray(blurred_background)
+  #cv2_imshow(src)
+  byte=gray2blackwhite(src)
+  #cv2_imshow(byte)
+  cnt_filtered=byte2countors(img, byte)
+  x_array, y_array = counturs2centers(cnt_filtered, img)
+  return(x_array, y_array)
+
+def center_of_nevus(img):
+  kernel = np.ones((17,17),np.uint8)
+  byte=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2hsv_return_h(img), 20), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  square = cv2.countNonZero(byte)
+  width=img.shape[1]
+  height = img.shape[0]
+  x=0
+  y=0
+  weight=0
+  for j in range(width):
+    for i in range(height):
+      if byte[i,j]>0:
+        x=x+j
+        y=y+i
+        weight=weight+1
+  xc=x/weight if weight>0 else width/2
+  yc=y/weight if weight>0 else height/2
+  return(xc, yc, square)
+
+def al_arrays(x_array, y_array, angle):
+  al_array_x=[]
+  al_array_y=[]
+  for i in range(len(x_array)):
+    al_array_x.append(x_array[i]/cos(angle) - y_array[i]/sin(angle))
+    al_array_y.append(y_array[i]/cos(angle) + x_array[i]/sin(angle))
+  return(al_array_x, al_array_y)
+
+def average_value (array, center):
+  sum=0
+  number=0
+  for i in range(0,len(array)):
+    sum=sum+(array[i]-center)
+    number=number+1
+  return (abs(sum/number))
+
+def gray_symmetry(img, x_0,y_0):
+  gray=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY )
+  kernel = np.ones((17,17),np.uint8)
+  mask=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2hsv_return_h(img), 20), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  nx = img.shape[1]
+  ny = img.shape[0]
+  sum_x = 0
+  sum_y = 0
+  sum_w = 0
+  for ix in range(nx):
+    for iy in range(ny):
+      if mask[iy,ix]>0:
+        w = gray[iy,ix]
+        sum_x += (ix - x_0)*w
+        sum_y += (iy - y_0)*w
+        sum_w += w
+  return(abs(sum_x/sum_w), abs(sum_y/sum_w))
+
+def histogram_y_symmetry(img, center):
+  mask_up = np.zeros(img.shape[:2], np.uint8)
+  mask_up[0:int(center), 0:img.shape[1]] = 255
+  masked_img_up = cv2.bitwise_and(img, img, mask=mask_up)
+  hist_mask_up = cv2.calcHist([img], [0], mask_up, [256], [1, 256])
+  mask_down = np.zeros(img.shape[:2], np.uint8)
+  mask_down[int(center):img.shape[0], 0:img.shape[1]] = 255
+  masked_img_down = cv2.bitwise_and(img, img, mask=mask_down)
+  hist_mask_down = cv2.calcHist([img], [0], mask_down, [256], [1, 256])
+  return(cv2.compareHist(hist_mask_up, hist_mask_down, cv2.HISTCMP_CORREL))
+
+def histogram_x_symmetry(img, center):
+  mask_left = np.zeros(img.shape[:2], np.uint8)
+  mask_left[0:img.shape[0], 0:int(center)] = 255
+  masked_img_left = cv2.bitwise_and(img, img, mask=mask_left)
+  hist_mask_left = cv2.calcHist([img], [0], mask_left, [256], [1, 256])
+  mask_right = np.zeros(img.shape[:2], np.uint8)
+  mask_right[0:img.shape[0], int(center):img.shape[1]] = 255
+  masked_img_right = cv2.bitwise_and(img, img, mask=mask_right)
+  hist_mask_right = cv2.calcHist([img], [0], mask_right, [256], [1, 256])
+  return(cv2.compareHist(hist_mask_left, hist_mask_right, cv2.HISTCMP_CORREL))
+
+def colour_y(img, y_c, x_array, y_array, ch):
+  lst = cv2.split(img)
+  channel=lst[ch]
+  sum=0
+  sum_part=0
+  for i in range(len(x_array)):
+    iy=int(x_array[i])
+    ix=int(y_array[i])
+    sum+=channel[ix,iy]
+    if iy>y_c:
+      sum_part+= channel[ix,iy]
+  return(sum_part/sum)
+
+def colour_x(img, x_c, x_array, y_array, ch):
+  lst = cv2.split(img)
+  channel=lst[ch]
+  sum=0
+  sum_part=0
+  for i in range(len(x_array)):
+    iy=int(x_array[i])
+    ix=int(y_array[i])
+    sum+=channel[ix,iy]
+    if ix>x_c:
+      sum_part+= channel[ix,iy]
+  return(sum_part/sum)
+
+def standard_deviation(x_0, y_0, x_array, y_array):
+  lst_std_xpos_y=[]
+  lst_std_xneg_y=[]
+  lst_std_xpos_x=[]
+  lst_std_xneg_x=[]
+  lst_std_ypos_x=[]
+  lst_std_yneg_x=[]
+  lst_std_ypos_y=[]
+  lst_std_yneg_y=[]
+  for i in range(len(x_array)):
+    if x_array[i]>x_0:
+      lst_std_xpos_y.append(y_array[i])
+      lst_std_xpos_x.append(x_array[i])
+    else:
+      lst_std_xneg_y.append(y_array[i])
+      lst_std_xneg_x.append(x_array[i])
+    if y_array[i]>y_0:
+      lst_std_ypos_y.append(y_array[i])
+      lst_std_ypos_x.append(x_array[i])
+    else:
+      lst_std_yneg_y.append(y_array[i])
+      lst_std_yneg_x.append(x_array[i])
+  s1=np.std(lst_std_ypos_x)/np.std(lst_std_yneg_x) if np.std(lst_std_yneg_x)!=0 else 0.0 
+  s2=np.std(lst_std_ypos_y)/np.std(lst_std_yneg_y) if np.std(lst_std_yneg_y)!=0 else 0.0 
+  s3=np.std(lst_std_xpos_x)/np.std(lst_std_xneg_x) if np.std(lst_std_xneg_x)!=0 else 0.0 
+  s4=np.std(lst_std_xpos_y)/np.std(lst_std_xneg_y) if np.std(lst_std_xneg_y)!=0 else 0.0 
+  return(s1, s2, s3, s4)
+
+def get_image_features(img: np.ndarray) -> dict:
+    features = {}
+    x_array, y_array = centrum_globules(img)
+    x_0,y_0,square=center_of_nevus(img)
+    angle=align_object(img)
+    al_x_array, al_y_array=al_arrays(x_array, y_array, angle)
+    al_x_0=x_0/cos(angle) - y_0/sin(angle)
+    al_y_0=y_0/cos(angle) + x_0/sin(angle)
+    average_x=(average_value (al_x_array, al_x_0))
+    features['average_x'] = average_x
+    average_y=(average_value (al_y_array, al_y_0))
+    features['average_y'] = average_y
+    """gray_sim_x, gray_sim_y = gray_symmetry(img, x_0,y_0)
+    features['gray_sim_x'] = gray_sim_x
+    features['gray_sim_y'] = gray_sim_y
+    hist_sim_x=histogram_x_symmetry(img, x_0)
+    features['hist_sim_x'] = hist_sim_x
+    hist_sim_y=histogram_y_symmetry(img, y_0)
+    features['hist_sim_y'] = hist_sim_y"""
+    red_x=colour_y(img, y_0, x_array, y_array, 0)
+    features['red_x'] = red_x
+    green_x=colour_y(img, y_0, x_array, y_array, 1)
+    features['green_x'] = green_x
+    blue_x=colour_y(img, y_0, x_array, y_array, 2)
+    features['blue_x'] = blue_x
+    red_y=colour_x(img, x_0, x_array, y_array, 0)
+    features['red_y'] = red_y
+    green_y=colour_x(img, x_0, x_array, y_array, 1)
+    features['green_y'] = green_y
+    blue_y=colour_x(img, x_0, x_array, y_array, 2)
+    features['blue_y'] = blue_y
+    std_1, std_2, std_3, std_4 = standard_deviation(al_x_0, al_y_0, al_x_array, al_y_array)
+    features['std_1'] = std_1
+    features['std_2'] = std_2
+    features['std_3'] = std_3
+    features['std_4'] = std_4 
+    return features
+
+def process_images_from_directory(directory: str, label: int) -> pd.DataFrame:
+    file_list = os.listdir(directory)
+    data = []
+
+    for file in file_list:
+        img_path = os.path.join(directory, file)
+        print(img_path)
+        img = cv2.imread(img_path)
+        #img=align_object(img1)
+        features = get_image_features(img)
+        features['image'] = file
+        features['label'] = label
+        data.append(features)
+
+    return pd.DataFrame(data)
+
+def train_classifier():
+    """
+    Trains classifier
+    :return: classifier
+    """
+    if not os.path.exists('all.csv'):
+        all_df = pd.concat([
+            process_images_from_directory('C:/study/ne_brosit/globules/simmetric', 1),
+            process_images_from_directory('C:/study/ne_brosit/globules/assimmetric', 0)
+        ])
+        all_df.to_csv('all.csv', index=False)
+    else:
+        all_df = pd.read_csv('all.csv')
+    print(all_df.head())
+    x_train, x_test, y_train, y_test = train_test_split(all_df.drop(['image', 'label'], axis=1), all_df['label'],
+                                                        test_size=0.2, stratify=all_df['label'], shuffle=True, random_state=33)
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=33)
+    clf.fit(x_train, y_train)
+
+    y_pred = clf.predict(x_test)
+    print(classification_report(y_test, y_pred))
+
+    return clf
+
+
+"""def classify_image(img: np.ndarray, classifier) -> str:
+    
+    Classifies image
+    :param img: image to classify
+    :param classifier: classifier to use
+    :return: predicted label
+
+    features = get_image_features(img)
+    df = pd.DataFrame([features])
+    pred = classifier.predict(df)
+    return pred"""
+
+def main(img: np.ndarray):
+  clf = load('one_globules_morethanonecolor_melanin.joblib')
+  features = get_image_features(img)
+  df = pd.DataFrame([features])
+  pred = clf.predict(df)
+  if pred == 0:
+     return 'АСИММЕТРИЧНОЕ РАСПОЛОЖЕНИЕ ГЛОБУЛ'
+  if pred == 1:
+     return 'СИММЕТРИЧНОЕ РАСПОЛОЖЕНИЕ ГЛОБУЛ'
+
+if __name__ == "__main__":
+    image_path = 'dataset/53.jpg'
+    image = cv2.imread(image_path)
+    label = main(image)
+    print(label)
+
+"""if not os.path.exists('clf.joblib'):
+    clf = train_classifier()
+    dump(clf, 'clf.joblib')
+else:
+    clf = load('clf.joblib')
+image_path = 'C:/study/ne_brosit/globules/simmetric/53.jpg'
+image = cv2.imread(image_path)
+label = main(image)
+print(f"Label of image: {label}")"""
